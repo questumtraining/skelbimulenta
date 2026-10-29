@@ -32,7 +32,7 @@ else:
 
 PBKDF2_ROUNDS = 310_000
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+app = Flask(__name__, root_path=ROOT, static_folder=ROOT / "static", static_url_path="/static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 
