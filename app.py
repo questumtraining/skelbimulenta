@@ -32,7 +32,7 @@ else:
 
 PBKDF2_ROUNDS = 310_000
 
-app = Flask(__name__, root_path=ROOT, static_folder=ROOT / "static", static_url_path="/static")
+app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 
@@ -809,3 +809,9 @@ def admin_account_regenerate():
 if __name__ == "__main__":
     init_db()
     app.run(host="127.0.0.1", port=8000, debug=True)
+
+
+@app.route('/static/<path:filename>')
+def serve_static_file(filename):
+    from flask import send_from_directory
+    return send_from_directory(ROOT / "static", filename)
