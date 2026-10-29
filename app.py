@@ -14,11 +14,8 @@ import smtplib
 import sqlite3
 import ssl
 import string
-import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.parser import BytesParser
-from email.policy import default
 from pathlib import Path
 from urllib.parse import quote
 
@@ -27,13 +24,12 @@ from flask import Flask, request, session, redirect, url_for, make_response
 
 ROOT = Path(__file__).resolve().parent
 
-# Vercel serverless aplinkoje naudojame /tmp katalogą rašymui į DB
+# Vercel serverless aplinkai pritaikytas /tmp katalogas duomenų bazei
 if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
     DB_PATH = Path(os.environ.get("QUESTUM_DB_PATH", "/tmp/questum.sqlite3"))
 else:
     DB_PATH = Path(os.environ.get("QUESTUM_DB_PATH", ROOT / "data" / "questum.sqlite3"))
 
-SESSION_HOURS = 12
 PBKDF2_ROUNDS = 310_000
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -108,13 +104,6 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_announcement_created ON announcements(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ratings_mentor ON ratings(mentor_id);
         """)
-        user_columns = {row["name"] for row in c.execute("PRAGMA table_info(users)")}
-        if "invite_secret" not in user_columns:
-            c.execute("ALTER TABLE users ADD COLUMN invite_secret TEXT")
-        if "invite_status" not in user_columns:
-            c.execute("ALTER TABLE users ADD COLUMN invite_status TEXT NOT NULL DEFAULT ''")
-        if "invite_updated_at" not in user_columns:
-            c.execute("ALTER TABLE users ADD COLUMN invite_updated_at TEXT")
 
 
 try:
@@ -256,55 +245,6 @@ def decrypt_invite_password(value: str | None) -> str:
         return ""
 
 
-def send_password_emails(accounts: list[tuple[int, str, str, str]]) -> dict[int, str]:
-    if not accounts:
-        return {}
-    host = os.environ.get("QUESTUM_SMTP_HOST", "").strip()
-    sender = os.environ.get("QUESTUM_SMTP_FROM", "").strip()
-    if not host or not sender:
-        return {account[0]: "not_configured" for account in accounts}
-    try:
-        port = int(os.environ.get("QUESTUM_SMTP_PORT", "587"))
-        use_ssl = os.environ.get("QUESTUM_SMTP_SSL", "").lower() in ("1", "true", "yes") or port == 465
-        smtp = (smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context())
-                if use_ssl else smtplib.SMTP(host, port, timeout=20))
-        if not use_ssl and os.environ.get("QUESTUM_SMTP_STARTTLS", "1").lower() not in ("0", "false", "no"):
-            smtp.starttls(context=ssl.create_default_context())
-        smtp.ehlo()
-        smtp_user = os.environ.get("QUESTUM_SMTP_USER", "")
-        if smtp_user:
-            smtp.login(smtp_user, os.environ.get("QUESTUM_SMTP_PASSWORD", ""))
-    except (OSError, smtplib.SMTPException, ValueError) as exc:
-        print(f"SMTP prisijungimas nepavyko: {type(exc).__name__}")
-        return {account[0]: "failed" for account in accounts}
-
-    statuses = {}
-    public_url = request.host_url.rstrip("/")
-    try:
-        for user_id, email, name, password in accounts:
-            message = EmailMessage()
-            message["Subject"] = "Questum Training paskyros prisijungimo duomenys"
-            message["From"] = sender
-            message["To"] = email
-            message.set_content(
-                f"Sveiki, {name}!\n\nSukurta jūsų Questum Training paskyra.\n"
-                f"Prisijungimo adresas: {public_url}/login\nEl. paštas: {email}\n"
-                f"Slaptažodis: {password}\n\nSaugokite šiuos prisijungimo duomenis."
-            )
-            try:
-                refused = smtp.send_message(message)
-                statuses[user_id] = "failed" if refused else "sent"
-            except (OSError, smtplib.SMTPException) as exc:
-                print(f"SMTP laiško išsiųsti nepavyko: {type(exc).__name__}")
-                statuses[user_id] = "failed"
-    finally:
-        try:
-            smtp.quit()
-        except (OSError, smtplib.SMTPException):
-            pass
-    return statuses
-
-
 def invitation_html(row, csrf: str, return_to: str) -> str:
     secret = decrypt_invite_password(row["invite_secret"])
     status = {
@@ -411,7 +351,6 @@ def home():
     user = get_current_user()
     if not user:
         return redirect(url_for("login", msg="Prisijunkite, kad galėtumėte tęsti."))
-    csrf = get_csrf()
     with db() as c:
         total_posts = c.execute("SELECT COUNT(*) FROM announcements WHERE published=1").fetchone()[0]
         total_mentors = c.execute("SELECT COUNT(*) FROM mentors WHERE active=1").fetchone()[0]
@@ -430,7 +369,6 @@ def home():
     cards = f'''<div class="stat-grid"><a class="stat-card" href="/"><strong>{total_posts}</strong><span>Skelbimai</span><i>↗</i></a><a class="stat-card" href="/mentors"><strong>{total_mentors}</strong><span>Aktyvūs mentoriai</span><i>↗</i></a><a class="stat-card" href="/mentors"><strong>{total_groups}</strong><span>Mokymosi grupės</span><i>↗</i></a></div>'''
     posts = []
     for row in rows:
-        # Dalyviams grupių pavadinimų nerodome (visada rodoma bendrinė žymė)
         scope = "Visiems" if row["visibility"] == "all" else (esc(row["group_name"]) if user["role"] == "admin" else "Mokymai")
         attachment = f'<a class="attachment" href="{esc(row["attachment_url"])}" target="_blank" rel="noopener noreferrer">Atidaryti priedą arba nuorodą ↗</a>' if row["attachment_url"] and safe_url(row["attachment_url"]) else ""
         posts.append(f'''<article class="post panel"><div class="post-meta"><span class="badge">{scope}</span><time>{esc(stamp(row['created_at']))}</time></div><h2>{esc(row['title'])}</h2><div class="prose">{markdown(row['body'])}</div>{attachment}<div class="post-author">Atsakingas: {esc(row['author'] or 'Questum Training')}</div></article>''')
@@ -492,7 +430,6 @@ def mentors():
     user = get_current_user()
     if not user:
         return redirect(url_for("login"))
-    csrf = get_csrf()
     query = request.args.get("q", "").strip()
     with db() as c:
         if query:
@@ -679,7 +616,7 @@ def admin_user_save():
                 account_id = uid
             else:
                 pwd = generate_password()
-                cur = c.execute("INSERT INTO users(name,email,role,password_hash,active,created_at,updated_at,invite_secret,invite_status,invite_updated_at) VALUES(?,?,?,?,1,?,?,?,?,?)",
+                cur = c.execute("INSERT INTO users(name,email,role,password_hash,active,created_at,updated_at,invite_secret,invite_status,invite_updated_at) VALUES(?,?,'participant',?,1,?,?,?,?,?)",
                                 (name, email, hash_password(pwd), now(), now(), encrypt_invite_password(pwd), "not_configured", now()))
                 account_id = cur.lastrowid
             for gid in group_ids:
